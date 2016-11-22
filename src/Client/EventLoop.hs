@@ -36,6 +36,11 @@ import           Control.Concurrent.STM
 import           Control.Exception
 import           Control.Lens
 import           Control.Monad
+import           Control.Monad.Trans.Except as E
+import           Control.Monad.Trans.Reader as E hiding (ask)
+import           Control.Monad.Reader.Class as C
+import           Control.Monad.Error.Class  as C
+import           Control.Monad.IO.Class as C
 import           Data.ByteString (ByteString)
 import           Data.Foldable
 import           Data.List
@@ -210,6 +215,65 @@ reconnectLogic ex cs st
           | Just NoSuchThing         <- ioe_type <$> fromException ex -> True
           | otherwise                                                 -> False
 
+type Env a
+  = ReaderT (NetworkId, ZonedTime, ByteString, ClientState)
+            (ExceptT ClientState IO) a
+
+checkNetwork :: Env NetworkState
+checkNetwork = do
+  (networkId, _, _, st) <- ask
+  case view (clientConnections . at networkId) st of
+    Just cs -> return cs
+    Nothing -> error "BUG: this should never happen"
+
+checkLine :: NetworkState -> Env RawIrcMsg
+checkLine cs =
+  do (_, time, line, st) <- ask
+     case parseRawIrcMsg (asUtf8 line) of
+       Nothing  -> let msg = Text.pack ("Malformed message: " ++ show line)
+                   in throwError $! recordError time cs msg st
+
+       Just raw -> return raw
+
+notifyExt :: Text -> RawIrcMsg -> Env (ClientState, ZonedTime)
+notifyExt network raw =
+  do (_, time, _, st) <- ask
+     (st1,passed) <- liftIO $ clientPark st $ \ptr ->
+                       notifyExtensions ptr network raw
+                         (view (clientExtensions . esActive) st)
+
+     let time' = computeEffectiveTime time (view msgTags raw)
+     if not passed
+       then throwError st1 -- out
+       else return (st1, time')
+
+applyExtension :: NetworkState -> ClientState -> RawIrcMsg
+               -> Env (IrcMsg, IrcMsg)
+applyExtension cs st1 raw =
+  let (stateHook, viewHook)
+              = over both applyMessageHooks
+              $ partition (view messageHookStateful)
+              $ lookups
+                  (view csMessageHooks cs)
+                  messageHooks
+  in case stateHook (cookIrcMsg raw) of
+       Nothing -> throwError st1
+       Just irc -> case viewHook irc of
+                     Nothing -> throwError st1
+                     Just irc' -> return (irc, irc')
+
+registerMsg :: NetworkState -> Text -> ZonedTime -> ClientState
+            -> IrcMsg -> IrcMsg -> ClientState
+registerMsg cs network time' st1 irc irc'
+  = recordIrcMessage network target msg st1
+  where
+    myNick = view csNick cs
+    target = msgTarget myNick irc
+    msg = ClientMessage
+            { _msgTime    = time'
+            , _msgNetwork = network
+            , _msgBody    = IrcBody irc'
+            }
 
 -- | Respond to an IRC protocol line. This will parse the message, updated the
 -- relevant connection state and update the UI buffers.
@@ -220,55 +284,20 @@ doNetworkLine ::
   ClientState {- ^ client state                     -} ->
   IO ClientState
 doNetworkLine networkId time line st =
-  case view (clientConnections . at networkId) st of
-    Nothing -> error "doNetworkLine: Network missing"
-    Just cs ->
-      let network = view csNetwork cs in
-      case parseRawIrcMsg (asUtf8 line) of
-        Nothing ->
-          do let msg = Text.pack ("Malformed message: " ++ show line)
-             return $! recordError time cs msg st
-
-        Just raw ->
-          do (st1,passed) <- clientPark st $ \ptr ->
-                               notifyExtensions ptr network raw
-                                 (view (clientExtensions . esActive) st)
-
-
-             if not passed then return st1 else do
-
-             let time' = computeEffectiveTime time (view msgTags raw)
-
-                 (stateHook, viewHook)
-                      = over both applyMessageHooks
-                      $ partition (view messageHookStateful)
-                      $ lookups
-                          (view csMessageHooks cs)
-                          messageHooks
-
-             case stateHook (cookIrcMsg raw) of
-               Nothing  -> return st1 -- Message ignored
-               Just irc ->
-                 do -- state with message recorded
-                    -- record messages *before* applying state changes
-                    let st2 =
-                          case viewHook irc of
-                            Nothing   -> st1 -- Message hidden
-                            Just irc' -> recordIrcMessage network target msg st1
-                              where
-                                myNick = view csNick cs
-                                target = msgTarget myNick irc
-                                msg = ClientMessage
-                                        { _msgTime    = time'
-                                        , _msgNetwork = network
-                                        , _msgBody    = IrcBody irc'
-                                        }
-
-                    let (replies, st3) = applyMessageToClientState time irc networkId cs st2
-
-                    traverse_ (sendMsg cs) replies
-                    clientResponse time' irc cs st3
-
+  runExceptT (runReaderT go (networkId, time, line, st))
+    >>= either return return
+  where
+    go :: Env ClientState
+    go = do cs  <- checkNetwork
+            let network = view csNetwork cs
+            raw <- checkLine cs
+            (st1, time') <- notifyExt network raw
+            (irc, irc') <- applyExtension cs st1 raw
+            let st2 = registerMsg cs network time' st1 irc irc'
+                (replies, st3) = applyMessageToClientState time
+                                   irc networkId cs st2
+            traverse_ (liftIO . sendMsg cs) replies
+            liftIO $ clientResponse time' irc cs st3
 
 -- | Client-level responses to specific IRC messages.
 -- This is in contrast to the connection state tracking logic in

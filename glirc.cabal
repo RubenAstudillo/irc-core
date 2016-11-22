@@ -143,6 +143,7 @@ library
                        text                 >=1.2.2  && <1.3,
                        time                 >=1.6    && <1.7,
                        transformers         >=0.5.2  && <0.6,
+                       mtl,
                        unix                 >=2.7    && <2.8,
                        unordered-containers >=0.2.7  && <0.3,
                        vector               >=0.11   && <0.12,
